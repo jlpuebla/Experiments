@@ -1,1 +1,5 @@
 .venv/
+
+# Ignore model weights and checkpoints
+*.pth
+models/*.pth

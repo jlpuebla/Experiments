@@ -12,7 +12,7 @@ from keras.datasets import mnist
 from sklearn.preprocessing import OneHotEncoder #not using
 from sklearn import metrics
 import collections
-from weight_utils import write_weights, generate_heatmap_for_weights_of_node
+from utils.weight_utils import write_weights, generate_heatmap_for_weights_of_node
 
 
 # load the dataset

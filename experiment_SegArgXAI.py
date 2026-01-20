@@ -10,6 +10,7 @@ from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 from groundingdino.util.inference import load_model, predict, load_image
 from ollama import get_components
+from captum.attr import IntegratedGradients, LayerGradCam
 
 from utils.model_utils import download_if_not_exists
 
@@ -108,7 +109,94 @@ if __name__ == "__main__":
     for box, label in zip(boxes, phrases):
         print(f"- {label}")
         x0, y0, x1, y1 = map(int, box)
+        print(box)
 
-    ''' 4. Argumentation framework generation '''
+    ''' 4. Evaluate feature importance'''
+    ''' 4a. Gradient-based attribution method '''
+    # Tracks gradients from here on
+    img_tensor.requires_grad_()
 
-    ''' 5. Explanation'''
+    # Initialize Integrated Gradients
+    ig = IntegratedGradients(model)
+
+    # Define a baseline: black image
+    baseline = torch.zeros_like(img_tensor)
+
+    # Compute attributions
+    attributions_ig, delta = ig.attribute(
+        img_tensor,
+        baselines=baseline,
+        target=predicted_class_id,
+        return_convergence_delta=True
+        )
+
+    # Convert to numpy for aggregation
+    attributions_ig = attributions_ig.squeeze().detach().cpu().numpy()
+
+    # Sum across color channels to get single-channel attribution
+    attributions_ig_sum = np.abs(attributions_ig).sum(axis=0)
+
+    # Example visualization
+    plt.imshow(attributions_ig_sum, cmap='hot')
+    plt.title("Integrated Gradients Attribution")
+    plt.axis("off")
+    plt.show()
+
+    ''' 4b. Quantify the component importance '''
+    img_pil = Image.open(IMAGE_PATH)
+    W_orig, H_orig = img_pil.size
+
+    scale_x = 224 / W_orig
+    scale_y = 224 / H_orig
+
+    scaled_boxes = []
+    for box in boxes:
+        x_center, y_center, width, height = box.tolist()
+    
+        # Convert to corners
+        x0 = (x_center - width / 2) * 224
+        y0 = (y_center - height / 2) * 224
+        x1 = (x_center + width / 2) * 224
+        y1 = (y_center + height / 2) * 224
+
+        # Convert to ints and clamp
+        x0 = int(max(0, min(224, x0)))
+        y0 = int(max(0, min(224, y0)))
+        x1 = int(max(0, min(224, x1)))
+        y1 = int(max(0, min(224, y1)))
+    
+        scaled_boxes.append([x0, y0, x1, y1])
+
+    # show boxes over attribution
+    plt.imshow(attributions_ig_sum, cmap="hot")
+    for box in scaled_boxes:
+        x0, y0, x1, y1 = box
+        plt.gca().add_patch(
+            plt.Rectangle((x0,y0), x1 - x0, y1 - y0, edgecolor="cyan", fill=False, lw=2)
+            )
+    plt.title("Scaled boxes over attribution heatmap")
+    plt.show()
+
+    component_importances = {}
+    
+    for label, box in zip(phrases, scaled_boxes):
+        x0, y0, x1, y1 = box
+        print(f"Label: {label}, Scaled box: {x0},{y0} to {x1},{y1}")
+
+        # Ensure box is within bounds
+        x0 = max(x0, 0)
+        y0 = max(y0, 0)
+        x1 = min(x1, attributions_ig_sum.shape[1])
+        y1 = min(y1, attributions_ig_sum.shape[0])
+        
+        # Crop attribution map
+        attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
+        
+        # Sum absolute attribution
+        component_importances[label] = np.abs(attribution_crop).sum()
+
+    print(f'Importance scores:\n{component_importances}')
+
+    ''' 5. Build argumentation framework '''
+
+    ''' 6. Generate Explanation'''

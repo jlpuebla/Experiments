@@ -60,11 +60,106 @@ def preprocess_image(image_path: str):
     return preprocess(img).unsqueeze(0)  # Add batch dimension
 
 def format_for_grounding_dino(components, main_class=None):
-    if main_class:
-        components = [main_class] + components
+    #if main_class:
+    #    components = [main_class] + components
 
     # Normalize to lowercase and singular if possible
     return " . ".join(c.lower() for c in components)
+ 
+def build_arguments( all_components: list, component_importances: dict,) -> list:
+    detected = set(component_importances.keys())
+    arguments = []
+
+    # Support arguments for detected components with their importance scores
+    for component, score in component_importances.items():
+        arguments.append({
+            "component": component,
+            "relation":  "support",
+            "weight":    float(score),
+        })
+
+    # Attack arguments for missing components with zero weight
+    for component in all_components:
+        if component not in detected:
+            arguments.append({
+                "component": component,
+                "relation":  "attack",
+                "weight":    0.0,
+            })
+ 
+    return arguments
+ 
+def build_argumentation_framework(
+    claim: str,
+    all_components: list,
+    component_importances: dict,
+) -> dict:
+    # If no components were detected, we cannot support the claim at all. Return early with an empty argument list and rejected claim.
+    if not all_components:
+        return {"claim": claim, "arguments": [], "accepted": False}
+    
+    # Build arguments based on detected components and their importance scores
+    arguments = build_arguments(all_components, component_importances)
+    supports = [a for a in arguments if a["relation"] == "support"]
+
+    # return the argumentation framework dict with claim, arguments, and acceptance status
+    return {
+        "claim":     claim,
+        "arguments": arguments,
+        "accepted":  len(supports) > 0,
+    }
+
+def compute_attention_scores(
+    component_importances: dict,
+    attributions_ig_sum: np.ndarray,
+) -> dict:
+    # Calculate total attribution across the entire image
+    ig_total = float(np.sum(np.maximum(attributions_ig_sum, 0)))
+
+    if ig_total == 0:
+        # return zero attention scores if the total attribution is zero to avoid division by zero
+        return {c: 0.0 for c in component_importances}
+    
+    # return attention scores as the proportion of each component's importance relative to the total positive attribution
+    return {
+        component: float(score / ig_total)
+        for component, score in component_importances.items()
+    }
+
+def generate_explanation(argumentation: dict, attention_scores: dict) -> str:
+    claim    = argumentation["claim"]
+    supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
+    attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
+ 
+    # Opening sentence
+    explanation = f"The image was classified as '{claim}'."
+ 
+    # Supporting evidence with attention scores
+    if supports:
+        support_details = ", ".join(
+            f"{a['component']} ({attention_scores.get(a['component'], 0.0):.0%} of model attention)"
+            for a in supports
+        )
+        explanation += (
+            f" The following features were identified and contributed to this "
+            f"classification: {support_details}."
+        )
+    else:
+        explanation += " No expected components were detected to support this classification."
+ 
+    # Attacking evidence — noted but not weighted
+    if attacks:
+        attack_names = ", ".join(a["component"] for a in attacks)
+        explanation += (
+            f" The following expected features were not detected: {attack_names}. "
+            f"However, their absence does not invalidate the classification."
+        )
+    else:
+        explanation += (
+            f" All expected features were detected. "
+        )
+ 
+    return explanation
 
 if __name__ == "__main__":
     # Ignore warnings
@@ -198,5 +293,27 @@ if __name__ == "__main__":
     print(f'Importance scores:\n{component_importances}')
 
     ''' 5. Build argumentation framework '''
+    argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=component_importances)
+ 
+    supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
+    attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
+ 
+    print("\nArgumentation framework:")
+    print(f"Claim: '{argumentation['claim']}'")
+    print(f"\nSupporting arguments ({len(supports)} detected components):")
+    for a in supports:
+        print(f" [+] {a['component']}  (IG={a['weight']:.2f})")
+    print(f"\nAttacking arguments ({len(attacks)} missing components):")
+    for a in attacks:
+        print(f" [-] {a['component']}")
 
     ''' 6. Generate Explanation'''
+    supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
+    attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
+    explanation = generate_explanation(argumentation, attention_scores)
+    print(f"\nClaim status : {supported}, {len(supports)} components detected.")
+    print(f"Explanation : {explanation}")
+
+    #TODO: visualize the bounding boxes on the original image
+    #TODO: visualize the argumentation framework as a graph, with support and attack edges, and confidence score.
+    #TODO: add more examples with different images and classes, and compare the explanations generated by the framework.

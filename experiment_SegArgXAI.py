@@ -15,7 +15,7 @@ from captum.attr import IntegratedGradients, LayerGradCam
 from utils.model_utils import download_if_not_exists
 
 # Paths
-IMAGE_PATH = "data/car.jpeg"
+IMAGE_PATH = "data/minivan.png"
 SAM_CHECKPOINT = "models/sam_vit_h.pth"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 DINO_CHECKPOINT = "models/groundingdino.pth"
@@ -126,33 +126,35 @@ def compute_attention_scores(
         for component, score in component_importances.items()
     }
 
-def generate_explanation(argumentation: dict, attention_scores: dict) -> str:
+def generate_explanation(argumentation: dict, attention_scores: dict, supported: str) -> str:
     claim    = argumentation["claim"]
     supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
     attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
  
     # Opening sentence
-    explanation = f"The image was classified as '{claim}'."
- 
+    explanation = (f"The image was classified as '{claim}'."
+                   f" This claim is {supported} by {len(supports)} components detected in the image."
+    )
+
     # Supporting evidence with attention scores
     if supports:
         support_details = ", ".join(
-            f"{a['component']} ({attention_scores.get(a['component'], 0.0):.0%} of model attention)"
+            f"{a['component']} ({attention_scores.get(a['component'], 0.0):.3%} contribution)"
             for a in supports
         )
         explanation += (
-            f" The following features were identified and contributed to this "
-            f"classification: {support_details}."
+            f" Detected components and their contribution to the classification: "
+            f"{support_details}."
         )
     else:
         explanation += " No expected components were detected to support this classification."
  
     # Attacking evidence — noted but not weighted
     if attacks:
-        attack_names = ", ".join(a["component"] for a in attacks)
+        #attack_names = ", ".join(a["component"] for a in attacks)
         explanation += (
-            f" The following expected features were not detected: {attack_names}. "
-            f"However, their absence does not invalidate the classification."
+            f" A total of {len(attacks)} expected components were not detected. "
+            f"Their absence does not invalidate the classification."
         )
     else:
         explanation += (
@@ -310,8 +312,7 @@ if __name__ == "__main__":
     ''' 6. Generate Explanation'''
     supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
     attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
-    explanation = generate_explanation(argumentation, attention_scores)
-    print(f"\nClaim status : {supported}, {len(supports)} components detected.")
+    explanation = generate_explanation(argumentation, attention_scores, supported)
     print(f"Explanation : {explanation}")
 
     #TODO: visualize the bounding boxes on the original image

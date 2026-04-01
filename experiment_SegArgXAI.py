@@ -10,6 +10,7 @@ from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 from groundingdino.util.inference import load_model, predict, load_image
 from ollama import get_components
+from captum.attr import IntegratedGradients, LayerGradCam
 
 from utils.model_utils import download_if_not_exists
 
@@ -59,11 +60,106 @@ def preprocess_image(image_path: str):
     return preprocess(img).unsqueeze(0)  # Add batch dimension
 
 def format_for_grounding_dino(components, main_class=None):
-    if main_class:
-        components = [main_class] + components
+    #if main_class:
+    #    components = [main_class] + components
 
     # Normalize to lowercase and singular if possible
     return " . ".join(c.lower() for c in components)
+ 
+def build_arguments( all_components: list, component_importances: dict,) -> list:
+    detected = set(component_importances.keys())
+    arguments = []
+
+    # Support arguments for detected components with their importance scores
+    for component, score in component_importances.items():
+        arguments.append({
+            "component": component,
+            "relation":  "support",
+            "weight":    float(score),
+        })
+
+    # Attack arguments for missing components with zero weight
+    for component in all_components:
+        if component not in detected:
+            arguments.append({
+                "component": component,
+                "relation":  "attack",
+                "weight":    0.0,
+            })
+ 
+    return arguments
+ 
+def build_argumentation_framework(
+    claim: str,
+    all_components: list,
+    component_importances: dict,
+) -> dict:
+    # If no components were detected, we cannot support the claim at all. Return early with an empty argument list and rejected claim.
+    if not all_components:
+        return {"claim": claim, "arguments": [], "accepted": False}
+    
+    # Build arguments based on detected components and their importance scores
+    arguments = build_arguments(all_components, component_importances)
+    supports = [a for a in arguments if a["relation"] == "support"]
+
+    # return the argumentation framework dict with claim, arguments, and acceptance status
+    return {
+        "claim":     claim,
+        "arguments": arguments,
+        "accepted":  len(supports) > 0,
+    }
+
+def compute_attention_scores(
+    component_importances: dict,
+    attributions_ig_sum: np.ndarray,
+) -> dict:
+    # Calculate total attribution across the entire image
+    ig_total = float(np.sum(np.maximum(attributions_ig_sum, 0)))
+
+    if ig_total == 0:
+        # return zero attention scores if the total attribution is zero to avoid division by zero
+        return {c: 0.0 for c in component_importances}
+    
+    # return attention scores as the proportion of each component's importance relative to the total positive attribution
+    return {
+        component: float(score / ig_total)
+        for component, score in component_importances.items()
+    }
+
+def generate_explanation(argumentation: dict, attention_scores: dict) -> str:
+    claim    = argumentation["claim"]
+    supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
+    attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
+ 
+    # Opening sentence
+    explanation = f"The image was classified as '{claim}'."
+ 
+    # Supporting evidence with attention scores
+    if supports:
+        support_details = ", ".join(
+            f"{a['component']} ({attention_scores.get(a['component'], 0.0):.0%} of model attention)"
+            for a in supports
+        )
+        explanation += (
+            f" The following features were identified and contributed to this "
+            f"classification: {support_details}."
+        )
+    else:
+        explanation += " No expected components were detected to support this classification."
+ 
+    # Attacking evidence — noted but not weighted
+    if attacks:
+        attack_names = ", ".join(a["component"] for a in attacks)
+        explanation += (
+            f" The following expected features were not detected: {attack_names}. "
+            f"However, their absence does not invalidate the classification."
+        )
+    else:
+        explanation += (
+            f" All expected features were detected. "
+        )
+ 
+    return explanation
 
 if __name__ == "__main__":
     # Ignore warnings
@@ -108,7 +204,116 @@ if __name__ == "__main__":
     for box, label in zip(boxes, phrases):
         print(f"- {label}")
         x0, y0, x1, y1 = map(int, box)
+        print(box)
 
-    ''' 4. Argumentation framework generation '''
+    ''' 4. Evaluate feature importance'''
+    ''' 4a. Gradient-based attribution method '''
+    # Tracks gradients from here on
+    img_tensor.requires_grad_()
 
-    ''' 5. Explanation'''
+    # Initialize Integrated Gradients
+    ig = IntegratedGradients(model)
+
+    # Define a baseline: black image
+    baseline = torch.zeros_like(img_tensor)
+
+    # Compute attributions
+    attributions_ig, delta = ig.attribute(
+        img_tensor,
+        baselines=baseline,
+        target=predicted_class_id,
+        return_convergence_delta=True
+        )
+
+    # Convert to numpy for aggregation
+    attributions_ig = attributions_ig.squeeze().detach().cpu().numpy()
+
+    # Sum across color channels to get single-channel attribution
+    attributions_ig_sum = np.abs(attributions_ig).sum(axis=0)
+
+    # Example visualization
+    plt.imshow(attributions_ig_sum, cmap='hot')
+    plt.title("Integrated Gradients Attribution")
+    plt.axis("off")
+    plt.show()
+
+    ''' 4b. Quantify the component importance '''
+    img_pil = Image.open(IMAGE_PATH)
+    W_orig, H_orig = img_pil.size
+
+    scale_x = 224 / W_orig
+    scale_y = 224 / H_orig
+
+    scaled_boxes = []
+    for box in boxes:
+        x_center, y_center, width, height = box.tolist()
+    
+        # Convert to corners
+        x0 = (x_center - width / 2) * 224
+        y0 = (y_center - height / 2) * 224
+        x1 = (x_center + width / 2) * 224
+        y1 = (y_center + height / 2) * 224
+
+        # Convert to ints and clamp
+        x0 = int(max(0, min(224, x0)))
+        y0 = int(max(0, min(224, y0)))
+        x1 = int(max(0, min(224, x1)))
+        y1 = int(max(0, min(224, y1)))
+    
+        scaled_boxes.append([x0, y0, x1, y1])
+
+    # show boxes over attribution
+    plt.imshow(attributions_ig_sum, cmap="hot")
+    for box in scaled_boxes:
+        x0, y0, x1, y1 = box
+        plt.gca().add_patch(
+            plt.Rectangle((x0,y0), x1 - x0, y1 - y0, edgecolor="cyan", fill=False, lw=2)
+            )
+    plt.title("Scaled boxes over attribution heatmap")
+    plt.show()
+
+    component_importances = {}
+    
+    for label, box in zip(phrases, scaled_boxes):
+        x0, y0, x1, y1 = box
+        print(f"Label: {label}, Scaled box: {x0},{y0} to {x1},{y1}")
+
+        # Ensure box is within bounds
+        x0 = max(x0, 0)
+        y0 = max(y0, 0)
+        x1 = min(x1, attributions_ig_sum.shape[1])
+        y1 = min(y1, attributions_ig_sum.shape[0])
+        
+        # Crop attribution map
+        attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
+        
+        # Sum absolute attribution
+        component_importances[label] = np.abs(attribution_crop).sum()
+
+    print(f'Importance scores:\n{component_importances}')
+
+    ''' 5. Build argumentation framework '''
+    argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=component_importances)
+ 
+    supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
+    attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
+ 
+    print("\nArgumentation framework:")
+    print(f"Claim: '{argumentation['claim']}'")
+    print(f"\nSupporting arguments ({len(supports)} detected components):")
+    for a in supports:
+        print(f" [+] {a['component']}  (IG={a['weight']:.2f})")
+    print(f"\nAttacking arguments ({len(attacks)} missing components):")
+    for a in attacks:
+        print(f" [-] {a['component']}")
+
+    ''' 6. Generate Explanation'''
+    supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
+    attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
+    explanation = generate_explanation(argumentation, attention_scores)
+    print(f"\nClaim status : {supported}, {len(supports)} components detected.")
+    print(f"Explanation : {explanation}")
+
+    #TODO: visualize the bounding boxes on the original image
+    #TODO: visualize the argumentation framework as a graph, with support and attack edges, and confidence score.
+    #TODO: add more examples with different images and classes, and compare the explanations generated by the framework.

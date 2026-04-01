@@ -14,7 +14,7 @@ from ollama import get_components
 from utils.model_utils import download_if_not_exists
 
 # Paths
-IMAGE_PATH = "data/car.jpeg"
+IMAGE_PATH = "data/istock.jpeg"
 SAM_CHECKPOINT = "models/sam_vit_h.pth"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 DINO_CHECKPOINT = "models/groundingdino.pth"

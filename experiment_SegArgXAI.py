@@ -4,6 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import urllib.request
 import warnings
+import mlflow
+import tempfile
+import os
 
 from torchvision import models, transforms
 from PIL import Image
@@ -172,148 +175,187 @@ if __name__ == "__main__":
     download_if_not_exists(SAM_URL, SAM_CHECKPOINT)
     download_if_not_exists(DINO_URL, DINO_CHECKPOINT)
 
-    ''' 1. Classify Image '''
-    # Load pretrained ResNet-50
-    model = models.resnet50(pretrained=True)
-    model.eval()  # set to inference mode
+    # Set the experiment name for MLflow tracking (create it if it doesn't exist)
+    mlflow.set_experiment("VisLocArgXAI")
 
-    # Preprocess input image
-    img_tensor = preprocess_image(IMAGE_PATH)
+    with mlflow.start_run():
 
-    # Classify image
-    predicted_class_id = ''
-    with torch.no_grad(): # do not track gradients, faster
-        output = model(img_tensor)
-        predicted_class_id = output.argmax().item()
+        # Log static run parameters
+        mlflow.log_param("image_path", IMAGE_PATH)
+        mlflow.log_param("device", str(device))
 
-    # Decode class id to label
-    url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-    imagenet_labels = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
-    predicted_class_name = imagenet_labels[predicted_class_id]
-    print("Predicted class:", predicted_class_name)
+        ''' 1. Classify Image '''
+        # Load pretrained ResNet-50
+        model = models.resnet50(pretrained=True)
+        model.eval()  # set to inference mode
 
-    ''' 2. Get list of components with LLM '''
-    components = get_components(predicted_class_name)
-    print(f'Components: {components}')
-    
-    dino_caption = format_for_grounding_dino(components=components, main_class=predicted_class_name)
-    print(f'Dino caption: {dino_caption}')
+        # Preprocess input image
+        img_tensor = preprocess_image(IMAGE_PATH)
 
-    ''' 3. Check component presence '''
-    boxes, logits, phrases = run_segmentation_and_grounding(dino_caption)
+        # Classify image
+        predicted_class_id = ''
+        with torch.no_grad(): # do not track gradients, faster
+            output = model(img_tensor)
+            predicted_class_id = output.argmax().item()
 
-    print('Detected:')
-    for box, label in zip(boxes, phrases):
-        print(f"- {label}")
-        x0, y0, x1, y1 = map(int, box)
-        print(box)
+        # Decode class id to label
+        url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
+        imagenet_labels = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
+        predicted_class_name = imagenet_labels[predicted_class_id]
+        print("Predicted class:", predicted_class_name)
 
-    ''' 4. Evaluate feature importance'''
-    ''' 4a. Gradient-based attribution method '''
-    # Tracks gradients from here on
-    img_tensor.requires_grad_()
+        # Step 1: log classification results
+        mlflow.log_param("predicted_class", predicted_class_name)
+        mlflow.log_param("predicted_class_id", predicted_class_id)
 
-    # Initialize Integrated Gradients
-    ig = IntegratedGradients(model)
+        ''' 2. Get list of components with LLM '''
+        components = get_components(predicted_class_name)
+        print(f'Components: {components}')
+        
+        dino_caption = format_for_grounding_dino(components=components, main_class=predicted_class_name)
+        print(f'Dino caption: {dino_caption}')
 
-    # Define a baseline: black image
-    baseline = torch.zeros_like(img_tensor)
+        # Step 2: log components and formatted caption for grounding dino
+        mlflow.log_param("components_expected", components)
+        mlflow.log_metric("num_components_expected", len(components))
+        mlflow.log_param("dino_caption", dino_caption)
 
-    # Compute attributions
-    attributions_ig, delta = ig.attribute(
-        img_tensor,
-        baselines=baseline,
-        target=predicted_class_id,
-        return_convergence_delta=True
-        )
+        ''' 3. Check component presence '''
+        boxes, logits, phrases = run_segmentation_and_grounding(dino_caption)
 
-    # Convert to numpy for aggregation
-    attributions_ig = attributions_ig.squeeze().detach().cpu().numpy()
+        print('Detected:')
+        for box, label in zip(boxes, phrases):
+            print(f"- {label}")
+            x0, y0, x1, y1 = map(int, box)
+            print(box)
 
-    # Sum across color channels to get single-channel attribution
-    attributions_ig_sum = np.abs(attributions_ig).sum(axis=0)
+        # Step 3: logging
+        mlflow.log_metric("num_components_detected", len(phrases))
+        mlflow.log_param("components_detected", phrases)
+        mlflow.log_metric("detection_rate", len(phrases) / len(components) if components else 0)
 
-    # Example visualization
-    plt.imshow(attributions_ig_sum, cmap='hot')
-    plt.title("Integrated Gradients Attribution")
-    plt.axis("off")
-    plt.show()
+        ''' 4. Evaluate feature importance'''
+        mlflow.log_param("attribution_method", "IG")
 
-    ''' 4b. Quantify the component importance '''
-    img_pil = Image.open(IMAGE_PATH)
-    W_orig, H_orig = img_pil.size
+        ''' 4a. Gradient-based attribution method '''
+        # Tracks gradients from here on
+        img_tensor.requires_grad_()
 
-    scale_x = 224 / W_orig
-    scale_y = 224 / H_orig
+        # Initialize Integrated Gradients
+        ig = IntegratedGradients(model)
 
-    scaled_boxes = []
-    for box in boxes:
-        x_center, y_center, width, height = box.tolist()
-    
-        # Convert to corners
-        x0 = (x_center - width / 2) * 224
-        y0 = (y_center - height / 2) * 224
-        x1 = (x_center + width / 2) * 224
-        y1 = (y_center + height / 2) * 224
+        # Define a baseline: black image
+        baseline = torch.zeros_like(img_tensor)
 
-        # Convert to ints and clamp
-        x0 = int(max(0, min(224, x0)))
-        y0 = int(max(0, min(224, y0)))
-        x1 = int(max(0, min(224, x1)))
-        y1 = int(max(0, min(224, y1)))
-    
-        scaled_boxes.append([x0, y0, x1, y1])
-
-    # show boxes over attribution
-    plt.imshow(attributions_ig_sum, cmap="hot")
-    for box in scaled_boxes:
-        x0, y0, x1, y1 = box
-        plt.gca().add_patch(
-            plt.Rectangle((x0,y0), x1 - x0, y1 - y0, edgecolor="cyan", fill=False, lw=2)
+        # Compute attributions
+        attributions_ig, delta = ig.attribute(
+            img_tensor,
+            baselines=baseline,
+            target=predicted_class_id,
+            return_convergence_delta=True
             )
-    plt.title("Scaled boxes over attribution heatmap")
-    plt.show()
 
-    component_importances = {}
+        # Convert to numpy for aggregation
+        attributions_ig = attributions_ig.squeeze().detach().cpu().numpy()
+
+        # Sum across color channels to get single-channel attribution
+        attributions_ig_sum = np.abs(attributions_ig).sum(axis=0)
+
+        # Visualize and log the IG heatmap as an artifact
+        fig, ax = plt.subplots()
+        ax.imshow(attributions_ig_sum, cmap='hot')
+        ax.set_title("Integrated Gradients Attribution")
+        ax.axis("off")
+        with tempfile.TemporaryDirectory() as tmp:
+            heatmap_path = os.path.join(tmp, "ig_heatmap.png")
+            fig.savefig(heatmap_path, bbox_inches="tight")
+            mlflow.log_artifact(heatmap_path)
+        plt.show()
+
+        ''' 4b. Quantify the component importance '''
+        img_pil = Image.open(IMAGE_PATH)
+        W_orig, H_orig = img_pil.size
+
+        scaled_boxes = []
+        for box in boxes:
+            x_center, y_center, width, height = box.tolist()
+        
+            x0 = int(max(0, min(224, (x_center - width / 2) * 224)))
+            y0 = int(max(0, min(224, (y_center - height / 2) * 224)))
+            x1 = int(max(0, min(224, (x_center + width / 2) * 224)))
+            y1 = int(max(0, min(224, (y_center + height / 2) * 224)))
+        
+            scaled_boxes.append([x0, y0, x1, y1])
+
+        # Visualize and log the IG heatmap with detected boxes overlaid as an artifact
+        fig2, ax2 = plt.subplots()
+        ax2.imshow(attributions_ig_sum, cmap="hot")
+        for box in scaled_boxes:
+            x0, y0, x1, y1 = box
+            ax2.add_patch(
+                plt.Rectangle((x0, y0), x1-x0, y1-y0, edgecolor="cyan", fill=False, lw=2)
+            )
+        ax2.set_title("Scaled boxes over attribution heatmap")
+        with tempfile.TemporaryDirectory() as tmp:
+            boxes_path = os.path.join(tmp, "ig_boxes.png")
+            fig2.savefig(boxes_path, bbox_inches="tight")
+            mlflow.log_artifact(boxes_path)
+        plt.show()
+
+        component_importances = {}
+        
+        for label, box in zip(phrases, scaled_boxes):
+            x0, y0, x1, y1 = box
+            print(f"Label: {label}, Scaled box: {x0},{y0} to {x1},{y1}")
+
+            # Ensure box is within bounds
+            x0 = max(x0, 0)
+            y0 = max(y0, 0)
+            x1 = min(x1, attributions_ig_sum.shape[1])
+            y1 = min(y1, attributions_ig_sum.shape[0])
+            
+            # Crop attribution map
+            attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
+            
+            # Sum absolute attribution
+            component_importances[label] = np.abs(attribution_crop).sum()
+
+        print(f'Importance scores:\n{component_importances}')
+
+        # Step 4: log component importance scores and total attribution
+        mlflow.log_dict(component_importances, "component_importances.json")
+        mlflow.log_metric("total_attribution", float(np.sum(attributions_ig_sum)))
+
+        ''' 5. Build argumentation framework '''
+        argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=component_importances)
     
-    for label, box in zip(phrases, scaled_boxes):
-        x0, y0, x1, y1 = box
-        print(f"Label: {label}, Scaled box: {x0},{y0} to {x1},{y1}")
+        supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
+        attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
+    
+        print("\nArgumentation framework:")
+        print(f"Claim: '{argumentation['claim']}'")
+        print(f"\nSupporting arguments ({len(supports)} detected components):")
+        for a in supports:
+            print(f" [+] {a['component']}  (IG={a['weight']:.2f})")
+        print(f"\nAttacking arguments ({len(attacks)} missing components):")
+        for a in attacks:
+            print(f" [-] {a['component']}")
 
-        # Ensure box is within bounds
-        x0 = max(x0, 0)
-        y0 = max(y0, 0)
-        x1 = min(x1, attributions_ig_sum.shape[1])
-        y1 = min(y1, attributions_ig_sum.shape[0])
-        
-        # Crop attribution map
-        attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
-        
-        # Sum absolute attribution
-        component_importances[label] = np.abs(attribution_crop).sum()
+        # Step 5: log argumentation framework details
+        mlflow.log_metric("num_support_args", len(supports))
+        mlflow.log_metric("num_attack_args", len(attacks))
+        mlflow.log_dict(argumentation, "argumentation_framework.json")
 
-    print(f'Importance scores:\n{component_importances}')
+        ''' 6. Generate Explanation'''
+        supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
+        attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
+        explanation = generate_explanation(argumentation, attention_scores, supported)
+        print(f"Explanation : {explanation}")
 
-    ''' 5. Build argumentation framework '''
-    argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=component_importances)
- 
-    supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
-    attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
- 
-    print("\nArgumentation framework:")
-    print(f"Claim: '{argumentation['claim']}'")
-    print(f"\nSupporting arguments ({len(supports)} detected components):")
-    for a in supports:
-        print(f" [+] {a['component']}  (IG={a['weight']:.2f})")
-    print(f"\nAttacking arguments ({len(attacks)} missing components):")
-    for a in attacks:
-        print(f" [-] {a['component']}")
-
-    ''' 6. Generate Explanation'''
-    supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
-    attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
-    explanation = generate_explanation(argumentation, attention_scores, supported)
-    print(f"Explanation : {explanation}")
+        # Step 6: log final explanation text
+        mlflow.log_param("result", supported)
+        mlflow.log_text(explanation, "explanation.txt")
+        mlflow.log_dict(attention_scores, "attention_scores.json")
 
     #TODO: visualize the bounding boxes on the original image
     #TODO: visualize the argumentation framework as a graph, with support and attack edges, and confidence score.

@@ -4,3 +4,4 @@
 *.pth
 models/*.pth
 mlruns/
+data/*_cropped.*

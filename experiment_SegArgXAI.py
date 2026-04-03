@@ -18,7 +18,7 @@ from captum.attr import IntegratedGradients, LayerGradCam
 from utils.model_utils import download_if_not_exists
 
 # Paths
-IMAGE_PATH = "data/minivan.png"
+IMAGE_PATH = "data/car.jpeg"
 SAM_CHECKPOINT = "models/sam_vit_h.pth"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 DINO_CHECKPOINT = "models/groundingdino.pth"
@@ -34,11 +34,11 @@ def load_sam():
     predictor = SamPredictor(sam)
     return predictor
 
-# Run segmentation 
-def run_segmentation_and_grounding(caption: str):
-    image = cv2.imread(IMAGE_PATH)
+# Run segmentation — accepts an explicit image_path so it can operate on the cropped image
+def run_segmentation_and_grounding(caption: str, image_path: str):
+    image = cv2.imread(image_path)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image_source, image_tensor = load_image(IMAGE_PATH)
+    image_source, image_tensor = load_image(image_path)
 
     predictor = load_sam()
     predictor.set_image(image_rgb)
@@ -61,15 +61,11 @@ def preprocess_image(image_path: str):
         ])
     img = Image.open(image_path).convert("RGB")
     return preprocess(img).unsqueeze(0)  # Add batch dimension
-
-def format_for_grounding_dino(components, main_class=None):
-    #if main_class:
-    #    components = [main_class] + components
-
-    # Normalize to lowercase and singular if possible
-    return " . ".join(c.lower() for c in components)
  
-def build_arguments( all_components: list, component_importances: dict,) -> list:
+def build_arguments(
+        all_components: list,
+        component_importances: dict,
+        ) -> list:
     detected = set(component_importances.keys())
     arguments = []
 
@@ -129,7 +125,11 @@ def compute_attention_scores(
         for component, score in component_importances.items()
     }
 
-def generate_explanation(argumentation: dict, attention_scores: dict, supported: str) -> str:
+def generate_explanation(
+        argumentation: dict,
+        attention_scores: dict,
+        supported: str,
+        ) -> str:
     claim    = argumentation["claim"]
     supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
     attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
@@ -166,6 +166,29 @@ def generate_explanation(argumentation: dict, attention_scores: dict, supported:
  
     return explanation
 
+def visualize_boxes(
+    image,
+    scaled_boxes: list,
+    title: str,
+    box_color: str = "cyan",
+    labels: list = None,
+    cmap: str = None,
+) -> plt.Figure:
+    fig, ax = plt.subplots()
+    ax.imshow(image, cmap=cmap)
+    for i, box in enumerate(scaled_boxes):
+        x0, y0, x1, y1 = box
+        ax.add_patch(
+            plt.Rectangle((x0, y0), x1 - x0, y1 - y0, edgecolor=box_color, fill=False, lw=2)
+        )
+        if labels:
+            ax.text(x0, y0 - 4, labels[i], color=box_color, fontsize=8,
+                    bbox=dict(facecolor="black", alpha=0.5, pad=1))
+    ax.set_title(title)
+    ax.axis("off")
+    plt.show()
+    return fig
+
 if __name__ == "__main__":
     # Ignore warnings
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -183,6 +206,18 @@ if __name__ == "__main__":
         # Log static run parameters
         mlflow.log_param("image_path", IMAGE_PATH)
         mlflow.log_param("device", str(device))
+
+        ''' 0. Crop image to model input space (shared by ResNet, IG, and DINO) '''
+        img_original = Image.open(IMAGE_PATH)
+
+        preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+        ])
+        img_cropped = preprocess(img_original)
+
+        CROPPED_IMAGE_PATH = IMAGE_PATH.replace(".", "_cropped.")
+        img_cropped.save(CROPPED_IMAGE_PATH)
 
         ''' 1. Classify Image '''
         # Load pretrained ResNet-50
@@ -202,7 +237,7 @@ if __name__ == "__main__":
         url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
         imagenet_labels = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
         predicted_class_name = imagenet_labels[predicted_class_id]
-        print("Predicted class:", predicted_class_name)
+        print(f"\nPredicted class: {predicted_class_name}")
 
         # Step 1: log classification results
         mlflow.log_param("predicted_class", predicted_class_name)
@@ -210,28 +245,24 @@ if __name__ == "__main__":
 
         ''' 2. Get list of components with LLM '''
         components = get_components(predicted_class_name)
-        print(f'Components: {components}')
+        print(f'\nExpected components: {components}')
         
-        dino_caption = format_for_grounding_dino(components=components, main_class=predicted_class_name)
-        print(f'Dino caption: {dino_caption}')
+        dino_caption = " . ".join(c.lower() for c in components)
 
         # Step 2: log components and formatted caption for grounding dino
         mlflow.log_param("components_expected", components)
         mlflow.log_metric("num_components_expected", len(components))
         mlflow.log_param("dino_caption", dino_caption)
 
-        ''' 3. Check component presence '''
-        boxes, logits, phrases = run_segmentation_and_grounding(dino_caption)
-
-        print('Detected:')
-        for box, label in zip(boxes, phrases):
-            print(f"- {label}")
-            x0, y0, x1, y1 = map(int, box)
-            print(box)
+        ''' 3. Check component presence — DINO runs on the cropped image '''
+        boxes, logits, phrases = run_segmentation_and_grounding(dino_caption, CROPPED_IMAGE_PATH)
+        detected_components_boxes = "\n".join(f"{label}: {box}" for label, box in zip(phrases, boxes))
+        print(f'\nDetected components: {phrases}')
 
         # Step 3: logging
         mlflow.log_metric("num_components_detected", len(phrases))
         mlflow.log_param("components_detected", phrases)
+        mlflow.log_text(detected_components_boxes, "detected_components_boxes.txt")
         mlflow.log_metric("detection_rate", len(phrases) / len(components) if components else 0)
 
         ''' 4. Evaluate feature importance'''
@@ -273,9 +304,7 @@ if __name__ == "__main__":
         plt.show()
 
         ''' 4b. Quantify the component importance '''
-        img_pil = Image.open(IMAGE_PATH)
-        W_orig, H_orig = img_pil.size
-
+        # DINO boxes are normalized to the 224x224 cropped image — scale directly to pixel space
         scaled_boxes = []
         for box in boxes:
             x_center, y_center, width, height = box.tolist()
@@ -287,26 +316,37 @@ if __name__ == "__main__":
         
             scaled_boxes.append([x0, y0, x1, y1])
 
-        # Visualize and log the IG heatmap with detected boxes overlaid as an artifact
-        fig2, ax2 = plt.subplots()
-        ax2.imshow(attributions_ig_sum, cmap="hot")
-        for box in scaled_boxes:
-            x0, y0, x1, y1 = box
-            ax2.add_patch(
-                plt.Rectangle((x0, y0), x1-x0, y1-y0, edgecolor="cyan", fill=False, lw=2)
-            )
-        ax2.set_title("Scaled boxes over attribution heatmap")
+        # Visualize and log the images with detected boxes overlaid as an artifact
+        fig2 = visualize_boxes(
+            image=attributions_ig_sum,
+            scaled_boxes=scaled_boxes,
+            title="Detected components on attribution heatmap",
+            box_color="cyan",
+            labels=phrases,
+            cmap="hot",
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            boxes_path = os.path.join(tmp, "ig_boxes.png")
-            fig2.savefig(boxes_path, bbox_inches="tight")
-            mlflow.log_artifact(boxes_path)
-        plt.show()
+            path = os.path.join(tmp, "ig_boxes.png")
+            fig2.savefig(path, bbox_inches="tight")
+            mlflow.log_artifact(path)
 
-        component_importances = {}
+        fig3 = visualize_boxes(
+            image=img_cropped,
+            scaled_boxes=scaled_boxes,
+            title="Detected components on image (224×224)",
+            box_color="lime",
+            labels=phrases,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "original_image_boxes.png")
+            fig3.savefig(path, bbox_inches="tight")
+            mlflow.log_artifact(path)
+
+        aggregated_component_importance = {}
+        individual_component_importance = []
         
         for label, box in zip(phrases, scaled_boxes):
             x0, y0, x1, y1 = box
-            print(f"Label: {label}, Scaled box: {x0},{y0} to {x1},{y1}")
 
             # Ensure box is within bounds
             x0 = max(x0, 0)
@@ -316,18 +356,23 @@ if __name__ == "__main__":
             
             # Crop attribution map
             attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
+
+            # single component importance is the sum of attributions within the box
+            importance_score = float(np.abs(attribution_crop).sum())
+            individual_component_importance.append((label, importance_score))
             
             # Sum absolute attribution
-            component_importances[label] = np.abs(attribution_crop).sum()
+            aggregated_component_importance[label] = aggregated_component_importance.get(label, 0.0) + importance_score #np.abs(attribution_crop).sum()
 
-        print(f'Importance scores:\n{component_importances}')
+        print(f'\nImportance scores: {aggregated_component_importance}')
 
         # Step 4: log component importance scores and total attribution
-        mlflow.log_dict(component_importances, "component_importances.json")
+        mlflow.log_dict(aggregated_component_importance, "aggregated_component_importance.json")
+        mlflow.log_text("\n".join([f"{label}: {score}" for label, score in individual_component_importance]), "individual_component_importance.txt")
         mlflow.log_metric("total_attribution", float(np.sum(attributions_ig_sum)))
 
         ''' 5. Build argumentation framework '''
-        argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=component_importances)
+        argumentation = build_argumentation_framework(claim=predicted_class_name, all_components=components, component_importances=aggregated_component_importance)
     
         supports = [a for a in argumentation["arguments"] if a["relation"] == "support"]
         attacks  = [a for a in argumentation["arguments"] if a["relation"] == "attack"]
@@ -348,15 +393,13 @@ if __name__ == "__main__":
 
         ''' 6. Generate Explanation'''
         supported = "SUPPORTED" if argumentation["accepted"] else "UNSUPPORTED"
-        attention_scores = compute_attention_scores(component_importances, attributions_ig_sum)
+        attention_scores = compute_attention_scores(aggregated_component_importance, attributions_ig_sum)
         explanation = generate_explanation(argumentation, attention_scores, supported)
-        print(f"Explanation : {explanation}")
+        print(f"\nExplanation : {explanation}")
 
         # Step 6: log final explanation text
         mlflow.log_param("result", supported)
         mlflow.log_text(explanation, "explanation.txt")
         mlflow.log_dict(attention_scores, "attention_scores.json")
 
-    #TODO: visualize the bounding boxes on the original image
     #TODO: visualize the argumentation framework as a graph, with support and attack edges, and confidence score.
-    #TODO: add more examples with different images and classes, and compare the explanations generated by the framework.

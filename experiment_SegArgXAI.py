@@ -186,7 +186,7 @@ def visualize_boxes(
                     bbox=dict(facecolor="black", alpha=0.5, pad=1))
     ax.set_title(title)
     ax.axis("off")
-    plt.show()
+    #plt.show()
     return fig
 
 if __name__ == "__main__":
@@ -301,7 +301,7 @@ if __name__ == "__main__":
             heatmap_path = os.path.join(tmp, "ig_heatmap.png")
             fig.savefig(heatmap_path, bbox_inches="tight")
             mlflow.log_artifact(heatmap_path)
-        plt.show()
+        #plt.show()
 
         ''' 4b. Quantify the component importance '''
         # DINO boxes are normalized to the 224x224 cropped image — scale directly to pixel space

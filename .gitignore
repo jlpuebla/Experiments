@@ -3,3 +3,5 @@
 # Ignore model weights and checkpoints
 *.pth
 models/*.pth
+mlruns/
+data/*_cropped.*

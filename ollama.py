@@ -2,7 +2,14 @@ import requests
 
 def send_ollama_prompt(prompt: str, model: str = "mistral") -> str:
     try:
-        response = requests.post("http://localhost:11434/api/generate", json={"model": model, "prompt": prompt, "stream": False}, timeout=10)
+        response = requests.post(
+            "http://localhost:11434/api/generate", 
+            json={"model": model, 
+                  "prompt": prompt, 
+                  "stream": False,
+                  "options": {"temperature": 0, "seed": 42}
+                  },
+                  timeout=10)
         #print(f"Response: {response.json()}")
         data = response.json()
 

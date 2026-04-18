@@ -174,7 +174,7 @@ def visualize_boxes(
     labels: list = None,
     cmap: str = None,
 ) -> plt.Figure:
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(tight_layout=True)
     ax.imshow(image, cmap=cmap)
     for i, box in enumerate(scaled_boxes):
         x0, y0, x1, y1 = box
@@ -184,7 +184,6 @@ def visualize_boxes(
         if labels:
             ax.text(x0, y0 - 4, labels[i], color=box_color, fontsize=8,
                     bbox=dict(facecolor="black", alpha=0.5, pad=1))
-    ax.set_title(title)
     ax.axis("off")
     #plt.show()
     return fig
@@ -295,11 +294,10 @@ if __name__ == "__main__":
         # Visualize and log the IG heatmap as an artifact
         fig, ax = plt.subplots()
         ax.imshow(attributions_ig_sum, cmap='hot')
-        ax.set_title("Integrated Gradients Attribution")
         ax.axis("off")
         with tempfile.TemporaryDirectory() as tmp:
             heatmap_path = os.path.join(tmp, "ig_heatmap.png")
-            fig.savefig(heatmap_path, bbox_inches="tight")
+            fig.savefig(heatmap_path, bbox_inches="tight", pad_inches=0)
             mlflow.log_artifact(heatmap_path)
         #plt.show()
 
@@ -327,7 +325,7 @@ if __name__ == "__main__":
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "ig_boxes.png")
-            fig2.savefig(path, bbox_inches="tight")
+            fig2.savefig(path, bbox_inches="tight", pad_inches=0)
             mlflow.log_artifact(path)
 
         fig3 = visualize_boxes(
@@ -339,7 +337,7 @@ if __name__ == "__main__":
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "original_image_boxes.png")
-            fig3.savefig(path, bbox_inches="tight")
+            fig3.savefig(path, bbox_inches="tight", pad_inches=0)
             mlflow.log_artifact(path)
 
         aggregated_component_importance = {}

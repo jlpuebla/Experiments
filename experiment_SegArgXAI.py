@@ -2,6 +2,7 @@ import torch
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import networkx as nx
 import urllib.request
 import warnings
 import mlflow
@@ -18,7 +19,7 @@ from captum.attr import IntegratedGradients, LayerGradCam
 from utils.model_utils import download_if_not_exists
 
 # Paths
-IMAGE_PATH = "data/car.jpeg"
+IMAGE_PATH = "data/baldeagle1.jpg"
 SAM_CHECKPOINT = "models/sam_vit_h.pth"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
 DINO_CHECKPOINT = "models/groundingdino.pth"
@@ -165,6 +166,80 @@ def generate_explanation(
         )
  
     return explanation
+
+def visualize_argumentation_graph(
+    argumentation: dict,
+    attention_scores: dict,
+) -> plt.Figure:
+    claim = argumentation["claim"]
+    arguments = argumentation["arguments"]
+
+    supports = [a for a in arguments if a["relation"] == "support"]
+    attacks  = [a for a in arguments if a["relation"] == "attack"]
+
+    graph = nx.DiGraph()
+    graph.add_node(claim)
+    for a in arguments:
+        graph.add_node(a["component"])
+        graph.add_edge(a["component"], claim)
+
+    # Claim on top, supports on the bottom-left, attacks on the bottom-right —
+    # widths are proportional to how many of each so the claim stays centered
+    # over the full row even when one side is empty.
+    total = max(len(supports) + len(attacks), 1)
+    support_frac = len(supports) / total
+    attack_frac = len(attacks) / total
+
+    pos = {claim: (0.5, 1.0)}
+    for i, a in enumerate(supports):
+        pos[a["component"]] = ((i + 0.5) / max(len(supports), 1) * support_frac, 0.0)
+    for i, a in enumerate(attacks):
+        pos[a["component"]] = (support_frac + (i + 0.5) / max(len(attacks), 1) * attack_frac, 0.0)
+
+    node_colors = {claim: "steelblue"}
+    for a in supports:
+        node_colors[a["component"]] = "seagreen"
+    for a in attacks:
+        node_colors[a["component"]] = "firebrick"
+
+    edge_labels = {}
+    for a in supports:
+        edge_labels[(a["component"], claim)] = f"{attention_scores.get(a['component'], 0.0):.1%}"
+    for a in attacks:
+        edge_labels[(a["component"], claim)] = "absent"
+
+    fig, ax = plt.subplots(figsize=(max(6, len(arguments) * 1.4), 5))
+
+    nx.draw_networkx_nodes(
+        graph, pos, ax=ax,
+        node_color=[node_colors[node] for node in graph.nodes()],
+        node_size=2200,
+    )
+    nx.draw_networkx_labels(graph, pos, ax=ax, font_size=7, font_color="white")
+
+    nx.draw_networkx_edges(
+        graph, pos, ax=ax, edgelist=[(a["component"], claim) for a in supports],
+        edge_color="seagreen", arrowstyle="-|>", arrowsize=20, node_size=2200,
+        connectionstyle="arc3,rad=0.1",
+    )
+    nx.draw_networkx_edges(
+        graph, pos, ax=ax, edgelist=[(a["component"], claim) for a in attacks],
+        edge_color="firebrick", arrowstyle="-|>", arrowsize=20, node_size=2200,
+        connectionstyle="arc3,rad=0.1",
+    )
+    nx.draw_networkx_edge_labels(graph, pos, ax=ax, edge_labels=edge_labels, font_size=7)
+
+    ax.set_title(f"Argumentation graph for claim: '{claim}'")
+    ax.set_ylim(-0.15, 1.15)
+    ax.axis("off")
+
+    legend_handles = [
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="seagreen", markersize=12, label="Support (detected)"),
+        plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="firebrick", markersize=12, label="Attack (undetected)"),
+    ]
+    ax.legend(handles=legend_handles, loc="lower center", ncol=2, frameon=False)
+
+    return fig
 
 def visualize_boxes(
     image,
@@ -340,9 +415,9 @@ if __name__ == "__main__":
             fig3.savefig(path, bbox_inches="tight", pad_inches=0)
             mlflow.log_artifact(path)
 
-        aggregated_component_importance = {}
         individual_component_importance = []
-        
+        component_pixel_masks = {}
+
         for label, box in zip(phrases, scaled_boxes):
             x0, y0, x1, y1 = box
 
@@ -351,16 +426,26 @@ if __name__ == "__main__":
             y0 = max(y0, 0)
             x1 = min(x1, attributions_ig_sum.shape[1])
             y1 = min(y1, attributions_ig_sum.shape[0])
-            
+
             # Crop attribution map
             attribution_crop = attributions_ig_sum[y0:y1, x0:x1]
 
             # single component importance is the sum of attributions within the box
             importance_score = float(np.abs(attribution_crop).sum())
             individual_component_importance.append((label, importance_score))
-            
-            # Sum absolute attribution
-            aggregated_component_importance[label] = aggregated_component_importance.get(label, 0.0) + importance_score #np.abs(attribution_crop).sum()
+
+            # Union the pixels covered by this box into the label's mask, so that
+            # duplicate/overlapping detections of the same component (GroundingDINO
+            # frequently returns more than one box per phrase) don't get their
+            # shared pixels counted twice when we aggregate importance below.
+            mask = component_pixel_masks.setdefault(label, np.zeros_like(attributions_ig_sum, dtype=bool))
+            mask[y0:y1, x0:x1] = True
+
+        # Aggregate importance once per label from the deduplicated pixel mask
+        aggregated_component_importance = {
+            label: float(attributions_ig_sum[mask].sum())
+            for label, mask in component_pixel_masks.items()
+        }
 
         print(f'\nImportance scores: {aggregated_component_importance}')
 
@@ -400,4 +485,9 @@ if __name__ == "__main__":
         mlflow.log_text(explanation, "explanation.txt")
         mlflow.log_dict(attention_scores, "attention_scores.json")
 
-    #TODO: visualize the argumentation framework as a graph, with support and attack edges, and confidence score.
+        ''' 7. Visualize the argumentation framework as a graph '''
+        fig4 = visualize_argumentation_graph(argumentation, attention_scores)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "argumentation_graph.png")
+            fig4.savefig(path, bbox_inches="tight", pad_inches=0.2)
+            mlflow.log_artifact(path)
